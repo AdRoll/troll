@@ -1,7 +1,7 @@
 -module(troll_retro).
 -author('josh@qhool.com').
 
--export([start/0,start/2]).
+-export([start/0, start/2, add_triggers/1]).
 
 -behaviour(gen_server).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -10,18 +10,25 @@
 
 -record(rt_st,{tracer,
                pids = #{},
-               mrefs = #{}}).
+               mrefs = #{},
+               log_level = info}).
 start() ->
     start([],[]).
 
 start(MFSpecs, Triggers) ->
     gen_server:start({local,?MODULE},?MODULE, [MFSpecs, Triggers], []).
 
+add_triggers([_|_]=Triggers) ->
+    gen_server:call(?MODULE,{add_triggers, Triggers});
+add_triggers(Trigger) ->
+    add_triggers([Trigger]).
+
+
 init([MFSpecs,Triggers]) ->
     TracerState = tf_init(self(), Triggers),
-    {ok,Tracer} = dbg:tracer(process,{?MODULE,tf,TracerState}),
+    {ok,Tracer} = dbg:tracer(process,{fun ?MODULE:tf/2,TracerState}),
     dbg:p(all,call),
-    dbg:tpl(?MODULE,tf_call,[{'_',[],[]}]),
+    dbg:tpl(?MODULE,tf_cast,[{'_',[],[]}]),
     Known =
         [ begin dbg:tpl(Mod,Fun,[{'_',[],[{return_trace}]}]), Spec end
           || {Mod,Fun} = Spec <- MFSpecs,
@@ -34,14 +41,14 @@ init([MFSpecs,Triggers]) ->
     Unknown = MFSpecs -- Known,
     case Unknown of
         [] -> ok;
-        _ -> io:format(standard_error,
-                       [ "Some tracing specs not understood:~n" |
-                         [ "~t~p~n" || _ <- Unknown ] ],
-                       Unknown)
+        _ -> handle_print(warning,
+                          [ "Some tracing specs not understood:~n" |
+                            [ "~t~p~n" || _ <- Unknown ] ],
+                          Unknown, #rt_st{})
     end,
     case {Known,MFSpecs} of
         {[],[_|_]} ->
-            io:format(standard_error, "No tracing specs made sense.~n",[]);
+            handle_print(error, "No tracing specs made sense.~n",[],#rt_st{});
         _ ->
             ok
     end,
@@ -56,13 +63,30 @@ handle_call({monitor,Pid}, _From, #rt_st{ pids = Pids, mrefs = MRefs } = State) 
     State1 = State#rt_st{ pids = Pids#{ Pid => MRef },
                           mrefs = MRefs#{ MRef => Pid } },
     {reply,ok,State1};
+handle_call({add_triggers, Triggers}, _From, State) ->
+    tf_cast({add_triggers, Triggers}),
+    {reply,ok,State};
 handle_call(Msg, From, State) ->
-    io:format("Unknown call from ~p: ~p~n",[From,Msg]),
-    {reply,ok,State}.
+    {reply,ok,handle_print(warning,"Unknown call from ~p: ~p~n",[From,Msg],State)}.
 
+handle_cast({print, Level, Fmt, Args}, State) ->
+    {noreply, handle_print(Level,Fmt,Args,State)};
 handle_cast(Msg, State) ->
-    io:format("Unknown cast: ~p~n",[Msg]),
-    {noreply, State}.
+    {noreply, handle_print(warning,"Unknown cast: ~p~n",[Msg],State)}.
+
+numeric_level(debug) -> 0;
+numeric_level(info)  -> 1;
+numeric_level(warn)  -> 2;
+numeric_level(error) -> 3.
+
+handle_print(Level, Fmt, Args, #rt_st{ log_level = SetLevel } = State) ->
+    case numeric_level(Level) >= numeric_level(SetLevel) of
+        true ->
+            io:format(standard_error, "TR ~s: "++Fmt,
+                      [string:uppercase(atom_to_list(Level))|Args]);
+        _ -> ok
+    end,
+    State.
 
 handle_info({'DOWN',MRef, process, Pid, _Reason} = Down,
             #rt_st{ pids = Pids, mrefs = MRefs } = State) ->
@@ -71,8 +95,7 @@ handle_info({'DOWN',MRef, process, Pid, _Reason} = Down,
     tf_cast(Down),
     {noreply, State1};
 handle_info(Msg, State) ->
-    io:format("Unknown message: ~p~n",[Msg]),
-    {noreply, State}.
+    {noreply, handle_print(warning,"Unknown message: ~p~n",[Msg], State)}.
 
 -record(rt_pid,{messages = queue:new(),
                 message_count = 0,
@@ -91,40 +114,52 @@ handle_info(Msg, State) ->
               }).
 
 tf_init(Manager, Triggers) ->
-    add_triggers(Triggers, #rt_trc{ manager = Manager }).
+    do_add_triggers(Triggers, #rt_trc{ manager = Manager }).
 
-add_triggers(NewTriggers, #rt_trc{ triggers = Triggers }=St) ->
-    Triggers1 = lists:foldl(fun add_trigger/2, Triggers, NewTriggers),
+do_add_triggers(NewTriggers, #rt_trc{ triggers = Triggers }=St) ->
+    Triggers1 = lists:foldl(fun do_add_trigger/2, Triggers, NewTriggers),
     St#rt_trc{ triggers = Triggers1 }.
 
-add_trigger({Key,{Fun, InitState}}, Triggers) when is_function(Fun) ->
+do_add_trigger({Key,{Fun, InitState}}, Triggers) when is_function(Fun) ->
     Triggers#{ Key => #rt_trigger{ func = Fun, state = InitState } };
-add_trigger({Fun, InitState}, Triggers) when is_function(Fun) ->
-    add_trigger({make_ref(),{Fun,InitState}}, Triggers);
-add_trigger(Wut, Triggers) ->
-    io:format("Don't understand trigger ~p~n",[Wut]),
+do_add_trigger({Fun, InitState}, Triggers) when is_function(Fun) ->
+    do_add_trigger({make_ref(),{Fun,InitState}}, Triggers);
+do_add_trigger(Wut, Triggers) ->
+    warn("Don't understand trigger ~p~n",[Wut]),
     Triggers.
 
 tf_cast(_Message) ->
     ok.
 
-tf({trace,_,call,{?MODULE,tf_cast,[Message]}}, #rt_trc{} = St) ->
+tf(Msg, St) ->
+    dbg("tf: ~p ~p~n",[Msg,St]),
+    try tf_(Msg, St)
+    catch E:R:S ->
+            dbg("tf_ ~p:~p: ~n~p~n",[E,R,S]),
+            St
+    end.
+
+tf_({trace,_,call,{?MODULE,tf_cast,[Message]}}, #rt_trc{} = St) ->
     handle_tf_cast(Message, St);
-tf(Msg, #rt_trc{}=St) ->
-    St1 = store_trace(Msg, St),
+tf_(Msg, #rt_trc{}=St) ->
+    St1 = store_message(Msg, St),
     St2 = run_triggers(Msg, St1),
     St2;
-tf(A,St) ->
-    io:format("UNKNOWN TRACE MESSAGE ~w~n", [A]),
+tf_(A,St) ->
+    warn("UNKNOWN TRACE MESSAGE ~w~n", [A]),
     St.
 
 handle_tf_cast({'DOWN',_,process,Pid,_}, St) ->
-    end_trace(Pid, St).
+    end_trace(Pid, St);
+handle_tf_cast({add_triggers, Triggers}, St) ->
+    do_add_triggers(Triggers, St).
 
 run_triggers(Msg, #rt_trc{ triggers = Triggers } = St) ->
-    maps:fold(fun(K, Trig, St0) -> run_trigger(Msg, K, Trig, St0) end, Triggers, St).
+    dbg("run_triggers:~n~p~n",[Triggers]),
+    maps:fold(fun(K, Trig, St0) -> run_trigger(Msg, K, Trig, St0) end, St, Triggers).
 
 run_trigger(Msg, K, #rt_trigger{ func = Fun, state = TrigSt } = Trig, St) ->
+    dbg("run_trigger: ~p~n",[Trig]),
     #rt_trc{ triggers = Trigs } = St,
     {MaybeAction, TrigSt1} =
         case Fun(Msg, TrigSt) of
@@ -135,6 +170,7 @@ run_trigger(Msg, K, #rt_trigger{ func = Fun, state = TrigSt } = Trig, St) ->
             TrigSt0 ->
                 {none, TrigSt0}
         end,
+    dbg("Trigger said ~p~n", [MaybeAction]),
     {Action, TrigSt2} =
         case MaybeAction of
             Act when Act =:= start_trace; Act =:= print_trace;
@@ -167,30 +203,30 @@ run_trigger(Msg, K, #rt_trigger{ func = Fun, state = TrigSt } = Trig, St) ->
 start_trace(Msg, Trig, St) ->
     start_trace(Msg, trace_msg_pid(Msg), Trig, St).
 
-start_trace(_Msg, Pid, _Trig, #rt_trc{ pids = Pids } = St) when is_map_key(Pid, Pids) ->
+start_trace(_Msg, Pid, _Trig, #rt_trc{ pids = Pids } = St)
+  when is_map_key(Pid, Pids) ->
     St;
-start_trace(Msg, Pid, #rt_trigger{ message_limit = Lim, on_limit = OnLim },
-            #rt_trc{ pids = Pids } = St) ->
+start_trace(Msg, _Pid, #rt_trigger{ message_limit = Lim, on_limit = OnLim }, St) ->
     PidTrc = #rt_pid{ message_limit = Lim,
                       on_limit = OnLim },
-    store_trace(Msg, Pid, St#rt_trc{ pids = Pids#{ Pid => PidTrc } }).
+    store_message(Msg, set_trace(Msg, PidTrc, St)).
 
-store_trace(Msg, St) ->
-    store_trace(Msg, get_trace(Msg, St), St).
+store_message(Msg, St) ->
+    store_message(Msg, get_trace(Msg, St), St).
 
-store_trace(_Msg, error, St) ->
+store_message(_Msg, error, St) ->
     St;
-store_trace(Msg, {ok, #rt_pid{ message_count = N,
+store_message(Msg, {ok, #rt_pid{ message_count = N,
                                message_limit = Lim,
                                messages = Msgs } = PidTrace},
             St) when N =< Lim ->
-    PidTrace1 = PidTrace#rt_pid{ messages = queue:in_r(Msgs, Msg),
+    PidTrace1 = PidTrace#rt_pid{ messages = queue:in_r(Msg, Msgs),
                                  message_count = N + 1 },
     set_trace(Msg, PidTrace1, St);
-store_trace(Msg, {ok, #rt_pid{ on_limit = stop } }, St) ->
-    io:format("TRACE LIMIT HIT FOR ~p~n",[trace_msg_pid(Msg)]),
+store_message(Msg, {ok, #rt_pid{ on_limit = stop } }, St) ->
+    warn("TRACE LIMIT HIT FOR ~p~n",[trace_msg_pid(Msg)]),
     end_trace(Msg, St);
-store_trace(Msg, {ok, #rt_pid{ messages = Msgs,
+store_message(Msg, {ok, #rt_pid{ messages = Msgs,
                                message_count = N,
                                on_limit = rotate } = PidTrace},
             St) ->
@@ -199,9 +235,11 @@ store_trace(Msg, {ok, #rt_pid{ messages = Msgs,
     set_trace(Msg, PidTrace1, St).
 
 print_trace(MsgOrPid, #rt_trc{ printer = Printer } = St) ->
-    #rt_pid{ messages = Msgs,
-             printer = Printer} = get_trace(MsgOrPid, St),
-    [ Printer(Msg) || Msg <- queue:from_list(Msgs) ],
+    {ok, #rt_pid{ messages = Msgs,
+                  printer = Printer}} = get_trace(MsgOrPid, St),
+    MsgList = queue:to_list(Msgs),
+    dbg("Printing ~p~n",[MsgList]),
+    [ Printer(Msg) || Msg <- queue:to_list(Msgs) ],
     St.
 
 flush_trace(Msg, St) ->
@@ -229,10 +267,30 @@ remove_trace(Msg, St) when not is_pid(Msg) ->
 remove_trace(Pid, #rt_trc{ pids = Pids } = St) ->
     St#rt_trc{ pids = maps:remove(Pid, Pids) }.
 
+-define(PRINTFN(NAME,LEVEL),
+NAME(Fmt,Args) ->
+    gen_server:cast(?MODULE,{print,LEVEL,Fmt,Args})).
+
+?PRINTFN(dbg,debug).
+?PRINTFN(info,info).
+?PRINTFN(warn,warn).
+?PRINTFN(error,error).
+
 trace_msg_pid({trace,Pid,call,_MFA}) ->
     Pid;
 trace_msg_pid({trace,Pid,return_from,_MFA,_R}) ->
     Pid.
 
-default_printer(Msg) ->
-    io:format("~p~n",[Msg]).
+default_printer({trace,Pid,call,{M,F,A}}) ->
+    ArgsFmt =
+        case length(A) of
+            0 -> "";
+            Len ->
+                [_,_|AF] = lists:flatten(lists:duplicate(Len,", ~p")),
+                AF
+        end,
+    io:format("[~p] call   ~p:~p("++ArgsFmt++")~n", [Pid,M,F|A]);
+default_printer({trace,Pid,return_from,{M,F,_A},R}) ->
+    io:format("[~p] return ~p:~p(…) -> ~p~n",[Pid,M,F,R]);
+default_printer(Other) ->
+    io:format("??unknown?? ~p~n",[Other]).
