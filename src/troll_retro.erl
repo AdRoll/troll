@@ -1,22 +1,34 @@
 -module(troll_retro).
 -author('josh@qhool.com').
 
--export([start/0, start/2, add_triggers/1]).
+-export([start/0, add_triggers/1]).
 
 -behaviour(gen_server).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export([tf/2, tf_cast/1]).
 
--record(rt_st,{tracer,
-               pids = #{},
-               mrefs = #{},
-               log_level = info}).
-start() ->
-    start([],[]).
+-export_type([trigger_action/0, trigger_function/1, trigger_spec/1]).
 
-start(MFSpecs, Triggers) ->
-    gen_server:start({local,?MODULE},?MODULE, [MFSpecs, Triggers], []).
+-type trigger_action() :: start_trace | print_trace | print_message |
+                          flush_trace | end_trace | abort_trace | none.
+-type trigger_function(State) ::
+        fun((TraceMessage :: tuple(),State) -> trigger_action() |
+                                               {trigger_action(),State}).
+
+-type trigger_spec(State) ::
+        #{ key := term(),
+           function := trigger_function(State),
+           init_state := State,
+           patterns := [ TracePattern :: tuple() ],
+           capture_patterns => [ TracePattern :: tuple() ],
+           start_limit => pos_integer(),
+           print_limit => pos_integer(),
+           message_limit => pos_integer(),
+           on_message_limit => atom() }.
+
+start() ->
+    gen_server:start({local,?MODULE},?MODULE, [], []).
 
 add_triggers([_|_]=Triggers) ->
     gen_server:call(?MODULE,{add_triggers, Triggers});
@@ -24,36 +36,28 @@ add_triggers(Trigger) ->
     add_triggers([Trigger]).
 
 
-init([MFSpecs,Triggers]) ->
-    TracerState = tf_init(self(), Triggers),
-    {ok,Tracer} = dbg:tracer(process,{fun ?MODULE:tf/2,TracerState}),
-    dbg:p(all,call),
-    dbg:tpl(?MODULE,tf_cast,[{'_',[],[]}]),
-    Known =
-        [ begin dbg:tpl(Mod,Fun,[{'_',[],[{return_trace}]}]), Spec end
-          || {Mod,Fun} = Spec <- MFSpecs,
-             is_atom(Mod) andalso is_atom(Fun) ] ++
-        [ begin dbg:tpl(Mod, Match), Spec end
-          || {Mod,[_|_]=Match} = Spec <- MFSpecs, is_atom(Mod) ] ++
-        [ begin dbg:tpl(Mod,Fun,Match), Spec end
-          || {Mod,Fun,[_|_]=Match} = Spec <- MFSpecs,
-             is_atom(Mod), is_atom(Fun) ],
-    Unknown = MFSpecs -- Known,
-    case Unknown of
-        [] -> ok;
-        _ -> handle_print(warning,
-                          [ "Some tracing specs not understood:~n" |
-                            [ "~t~p~n" || _ <- Unknown ] ],
-                          Unknown, #rt_st{})
-    end,
-    case {Known,MFSpecs} of
-        {[],[_|_]} ->
-            handle_print(error, "No tracing specs made sense.~n",[],#rt_st{});
-        _ ->
-            ok
-    end,
-    link(Tracer),
-    {ok, #rt_st{ tracer = Tracer }}.
+%% gen_server implementation
+-record(rt_st,{tracer,
+               pids = #{},
+               mrefs = #{},
+               triggers = #{},
+               log_level = info}).
+-record(rt_trigger,{key,
+                    function,
+                    state,
+                    tpls,
+                    match_mfs,
+                    bad_patterns,
+                    start_limit = 100,
+                    print_limit = 5,
+                    message_limit = 100,
+                    on_message_limit = rotate :: rotate | end_trace |
+                                                 abort_trace,
+                    active = true,
+                    pids = #{} }).
+
+init(_) ->
+    {ok, #rt_st{}}.
 
 handle_call({monitor,Pid}, _From, #rt_st{ pids = Pids } = State)
   when is_map_key(Pid,Pids) ->
@@ -63,16 +67,88 @@ handle_call({monitor,Pid}, _From, #rt_st{ pids = Pids, mrefs = MRefs } = State) 
     State1 = State#rt_st{ pids = Pids#{ Pid => MRef },
                           mrefs = MRefs#{ MRef => Pid } },
     {reply,ok,State1};
-handle_call({add_triggers, Triggers}, _From, State) ->
-    tf_cast({add_triggers, Triggers}),
-    {reply,ok,State};
+handle_call({add_triggers, TriggerSpecs}, _From, State) ->
+    case build_triggers(TriggerSpecs, []) of
+        #{} = M when map_size(M) == 0 ->
+            err("No valid trigger specs~n",[]),
+            {reply,{error,no_valid_specs},State};
+        Triggers ->
+            #rt_st{ triggers = Existing } = State1 = ensure_tracing(State),
+            tf_cast({add_triggers, Triggers}),
+            maps:map(fun set_trigger_tpls/2, Triggers),
+            {reply,ok,State1#rt_st{ triggers = maps:merge(Existing, Triggers)}}
+    end;
 handle_call(Msg, From, State) ->
-    {reply,ok,handle_print(warning,"Unknown call from ~p: ~p~n",[From,Msg],State)}.
+    warn("Unknown call from ~p: ~p~n",[From,Msg]),
+    {reply,ok,State}.
+
+handle_info({'DOWN',MRef, process, Pid, _Reason} = Down,
+            #rt_st{ pids = Pids, mrefs = MRefs } = State) ->
+    State1 = State#rt_st{ pids = maps:remove(Pid,Pids),
+                          mrefs = maps:remove(MRef,MRefs) },
+    tf_cast(Down),
+    {noreply, State1};
+handle_info(Msg, State) ->
+    {noreply, handle_print(warning,"Unknown message: ~p~n",[Msg], State)}.
+
+ensure_tracing(#rt_st{ tracer = Tracer } = State) when is_pid(Tracer) ->
+    State;
+ensure_tracing(State) ->
+    TracerState = tf_init(),
+    {ok,Tracer} = dbg:tracer(process,{fun ?MODULE:tf/2,TracerState}),
+    dbg:p(all,call),
+    dbg:tpl(?MODULE,tf_cast,[{'_',[],[]}]),
+    link(Tracer),
+    tf_cast({set_manager,self()}),
+    info("Started tracer ~p~n",[Tracer]),
+    State#rt_st{ tracer = Tracer }.
+
+set_trigger_tpls(_K, #rt_trigger{ tpls = TPLs }) ->
+    [ erlang:apply(dbg,tpl,TPL) || TPL <- TPLs ].
+
+build_triggers([TrigSpec|More], Out) when is_map_key(key, TrigSpec),
+                                          is_map_key(function, TrigSpec),
+                                          is_map_key(init_state, TrigSpec),
+                                          is_map_key(patterns, TrigSpec) ->
+    case maps:fold(fun build_trigger_field/3, #rt_trigger{}, TrigSpec) of
+        #rt_trigger{ key = Key, tpls = [] } ->
+            err("Trigger ~p had no usable trace patterns.~n",[Key]),
+            build_triggers(More, Out);
+        #rt_trigger{ key = Key, bad_patterns = [_|_] = BadPats } = Trigger ->
+            warn("Trigger ~p had incomprehensible trace patterns: ~p~n",[Key, BadPats]),
+            build_triggers(More, [Trigger|Out])
+    end;
+build_triggers([BadSpec|More], Out) ->
+    err("Badly formed trigger spec: ~p~n",[BadSpec]),
+    build_triggers(More, Out);
+build_triggers([], Out) ->
+    maps:from_list( [ {K, Trig} || #rt_trigger{ key = K } = Trig <- Out ] ).
+
+build_trigger_field(key, Key, Trig) ->
+    Trig#rt_trigger{ key = Key };
+build_trigger_field(function, Fun, Trig) ->
+    Trig#rt_trigger{ function = Fun };
+build_trigger_field(init_state, State, Trig) ->
+    Trig#rt_trigger{ state = State };
+build_trigger_field(patterns, Pats, Trig) ->
+    {TPLs, MFs, Unknowns} = normalize_patterns(Pats),
+    Trig#rt_trigger{ tpls = TPLs, match_mfs = MFs, bad_patterns = Unknowns };
+build_trigger_field(start_limit, StartLim, Trig) ->
+    Trig#rt_trigger{ start_limit = StartLim };
+build_trigger_field(print_limit, PrintLim, Trig) ->
+    Trig#rt_trigger{ print_limit = PrintLim };
+build_trigger_field(message_limit, MsgLim, Trig) ->
+    Trig#rt_trigger{ message_limit = MsgLim };
+build_trigger_field(on_message_limt, OnMsgLim, Trig) ->
+    Trig#rt_trigger{ on_message_limit = OnMsgLim };
+build_trigger_field(_, _, Trig) ->
+    Trig.
 
 handle_cast({print, Level, Fmt, Args}, State) ->
     {noreply, handle_print(Level,Fmt,Args,State)};
 handle_cast(Msg, State) ->
-    {noreply, handle_print(warning,"Unknown cast: ~p~n",[Msg],State)}.
+    warn("Unknown cast: ~p~n",[Msg]),
+    {noreply, State}.
 
 numeric_level(debug) -> 0;
 numeric_level(info)  -> 1;
@@ -88,24 +164,12 @@ handle_print(Level, Fmt, Args, #rt_st{ log_level = SetLevel } = State) ->
     end,
     State.
 
-handle_info({'DOWN',MRef, process, Pid, _Reason} = Down,
-            #rt_st{ pids = Pids, mrefs = MRefs } = State) ->
-    State1 = State#rt_st{ pids = maps:remove(Pid,Pids),
-                          mrefs = maps:remove(MRef,MRefs) },
-    tf_cast(Down),
-    {noreply, State1};
-handle_info(Msg, State) ->
-    {noreply, handle_print(warning,"Unknown message: ~p~n",[Msg], State)}.
-
 -record(rt_pid,{messages = queue:new(),
                 message_count = 0,
                 message_limit = 100,
                 on_limit = rotate :: rotate | stop,
-                printer = fun default_printer/1}).
--record(rt_trigger,{func,
-                    state,
-                    message_limit = 100,
-                    on_limit = rotate :: rotate | stop }).
+                printer = fun default_printer/1,
+                triggers = []}).
 -record(rt_trc,{manager,
                 printer = fun default_printer/1,
                 store = true,
@@ -113,20 +177,8 @@ handle_info(Msg, State) ->
                 triggers = #{}
               }).
 
-tf_init(Manager, Triggers) ->
-    do_add_triggers(Triggers, #rt_trc{ manager = Manager }).
-
-do_add_triggers(NewTriggers, #rt_trc{ triggers = Triggers }=St) ->
-    Triggers1 = lists:foldl(fun do_add_trigger/2, Triggers, NewTriggers),
-    St#rt_trc{ triggers = Triggers1 }.
-
-do_add_trigger({Key,{Fun, InitState}}, Triggers) when is_function(Fun) ->
-    Triggers#{ Key => #rt_trigger{ func = Fun, state = InitState } };
-do_add_trigger({Fun, InitState}, Triggers) when is_function(Fun) ->
-    do_add_trigger({make_ref(),{Fun,InitState}}, Triggers);
-do_add_trigger(Wut, Triggers) ->
-    warn("Don't understand trigger ~p~n",[Wut]),
-    Triggers.
+tf_init() ->
+    #rt_trc{}.
 
 tf_cast(_Message) ->
     ok.
@@ -151,14 +203,20 @@ tf_(A,St) ->
 
 handle_tf_cast({'DOWN',_,process,Pid,_}, St) ->
     end_trace(Pid, St);
-handle_tf_cast({add_triggers, Triggers}, St) ->
-    do_add_triggers(Triggers, St).
+handle_tf_cast({add_triggers, Triggers}, #rt_trc{ triggers = Existing } = St) ->
+    St#rt_trc{ triggers = maps:merge(Existing, Triggers) };
+handle_tf_cast({set_manager, Pid}, St) ->
+    St#rt_trc{ manager = Pid }.
 
 run_triggers(Msg, #rt_trc{ triggers = Triggers } = St) ->
     dbg("run_triggers:~n~p~n",[Triggers]),
-    maps:fold(fun(K, Trig, St0) -> run_trigger(Msg, K, Trig, St0) end, St, Triggers).
+    maps:fold(fun(K, Trig, St0) ->
+                      run_trigger(Msg, trace_msg_pid(Msg), K, Trig, St0)
+              end, St, Triggers).
 
-run_trigger(Msg, K, #rt_trigger{ func = Fun, state = TrigSt } = Trig, St) ->
+run_trigger(Msg, Pid, K, #rt_trigger{ function = Fun, state = TrigSt,
+                                      active = Active, pids = TrigPids } = Trig,
+            St) when Active; is_map_key(Pid, TrigPids) ->
     dbg("run_trigger: ~p~n",[Trig]),
     #rt_trc{ triggers = Trigs } = St,
     {MaybeAction, TrigSt1} =
@@ -185,20 +243,25 @@ run_trigger(Msg, K, #rt_trigger{ func = Fun, state = TrigSt } = Trig, St) ->
     St1 = St#rt_trc{ triggers = Trigs#{ K => Trig1 } },
     case Action of
         start_trace ->   %%% begin storing trace messages for pid
-            start_trace(Msg, Trig, St1);
+            start_trace(Msg, Trig1, St1);
         print_trace ->   %%% print and clear accumulated messages
             print_trace(Msg, St1),
-            flush_trace(Msg, St1);
+            flush_trace(Msg, incr_prints(Trig1, St1));
+        print_message -> %%% print single message without starting to store
+            print_message(Msg, incr_prints(Trig1,St1));
         flush_trace ->   %%% clear messages without printing
             flush_trace(Msg, St1);
         end_trace   ->   %%% print messages and stop tracing
             print_trace(Msg, St1),
-            end_trace(Msg, St1);
+            end_trace(Msg, incr_prints(Trig1, St1));
         abort_trace ->   %%% stop tracing without printing
             end_trace(Msg, St1);
         none ->
             St1
-    end.
+    end;
+run_trigger(_Msg, _Pid, K, _Trigger, St) ->
+    dbg("Skipping trigger ~p~n",[K]),
+    St.
 
 start_trace(Msg, Trig, St) ->
     start_trace(Msg, trace_msg_pid(Msg), Trig, St).
@@ -206,10 +269,15 @@ start_trace(Msg, Trig, St) ->
 start_trace(_Msg, Pid, _Trig, #rt_trc{ pids = Pids } = St)
   when is_map_key(Pid, Pids) ->
     St;
-start_trace(Msg, _Pid, #rt_trigger{ message_limit = Lim, on_limit = OnLim }, St) ->
+start_trace(Msg, Pid, #rt_trigger{ active = true,
+                                   message_limit = Lim,
+                                   on_message_limit = OnLim }=Trig, St) ->
     PidTrc = #rt_pid{ message_limit = Lim,
                       on_limit = OnLim },
-    store_message(Msg, set_trace(Msg, PidTrc, St)).
+    St1 = incr_starts(Pid, Trig, St),
+    store_message(Msg, set_trace(Msg, PidTrc, St1));
+start_trace(_Msg, _Pid, _Trig, St) ->
+    St.
 
 store_message(Msg, St) ->
     store_message(Msg, get_trace(Msg, St), St).
@@ -233,6 +301,10 @@ store_message(Msg, {ok, #rt_pid{ messages = Msgs,
     PidTrace1 = PidTrace#rt_pid{ messages = queue:in_r(Msg, queue:drop_r(Msgs)),
                                  message_count = N - 1 },
     set_trace(Msg, PidTrace1, St).
+
+print_message(Msg, #rt_trc{ printer = Printer } = St) ->
+    Printer(Msg),
+    St.
 
 print_trace(MsgOrPid, #rt_trc{ printer = Printer } = St) ->
     {ok, #rt_pid{ messages = Msgs,
@@ -267,6 +339,27 @@ remove_trace(Msg, St) when not is_pid(Msg) ->
 remove_trace(Pid, #rt_trc{ pids = Pids } = St) ->
     St#rt_trc{ pids = maps:remove(Pid, Pids) }.
 
+incr_starts(Pid, #rt_trigger{ key = K, start_limit = Lim, pids = Pids } = Trigger,
+            #rt_trc{ triggers = Triggers } = State) when Lim > 1 ->
+    Trigger1 = Trigger#rt_trigger{ start_limit = Lim - 1,
+                                   pids = Pids#{ Pid => true } },
+    State#rt_trc{ triggers = Triggers#{ K => Trigger1 } };
+incr_starts(Pid, #rt_trigger{ key = K, pids = Pids } = Trigger,
+            #rt_trc{ triggers = Triggers } = State) ->
+    info("Trigger ~p hit start limit~n",[K]),
+    Trigger1 = Trigger#rt_trigger{ active = false,
+                                   pids = Pids#{ Pid => true } },
+    State#rt_trc{ triggers = Triggers#{ K => Trigger1 } }.
+
+
+incr_prints(#rt_trigger{ key = K, print_limit = Lim } = Trigger,
+            #rt_trc{ triggers = Triggers } = State) when Lim > 1 ->
+    Trigger1 = Trigger#rt_trigger{ print_limit = Lim - 1 },
+    State#rt_trc{ triggers = Triggers#{ K => Trigger1 }};
+incr_prints(#rt_trigger{ key = K }, #rt_trc{ triggers = Triggers } = State) ->
+    info("Trigger ~p hit print limit~n",[K]),
+    State#rt_trc{ triggers = maps:remove(K, Triggers) }.
+
 -define(PRINTFN(NAME,LEVEL),
 NAME(Fmt,Args) ->
     gen_server:cast(?MODULE,{print,LEVEL,Fmt,Args})).
@@ -274,12 +367,28 @@ NAME(Fmt,Args) ->
 ?PRINTFN(dbg,debug).
 ?PRINTFN(info,info).
 ?PRINTFN(warn,warn).
-?PRINTFN(error,error).
+?PRINTFN(err,error).
 
 trace_msg_pid({trace,Pid,call,_MFA}) ->
     Pid;
 trace_msg_pid({trace,Pid,return_from,_MFA,_R}) ->
     Pid.
+
+normalize_patterns(Patterns) ->
+    {Patterns0,MFs,Unknowns} = lists:unzip3(lists:map(fun normalize_pattern/1, Patterns)),
+    TPLs = lists:map(fun tuple_to_list/1, Patterns0),
+    {TPLs, MFs, Unknowns}.
+
+normalize_pattern({Mod,Fun}) when is_atom(Mod), is_atom(Fun) ->
+    {{Mod,Fun,[{'_',[],[{return_trace}]}]}, {Mod,Fun}, []};
+normalize_pattern({Mod,[_|_]=MatchSpec}) when is_atom(Mod) ->
+    {{Mod,MatchSpec}, {Mod,'_'}, []};
+normalize_pattern({Mod,Fun,[_|_]=MatchSpec}) when is_atom(Mod), is_atom(Fun) ->
+    {{Mod,Fun,MatchSpec}, {Mod,Fun}, []};
+normalize_pattern(Mod) when is_atom(Mod) ->
+    {{Mod,[{'_',[],[{return_trace}]}]}, {Mod,'_'}, []};
+normalize_pattern(Other) ->
+    {[],[],Other}.
 
 default_printer({trace,Pid,call,{M,F,A}}) ->
     ArgsFmt =
