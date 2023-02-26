@@ -1,7 +1,7 @@
 -module(troll_retro).
 -author('josh@qhool.com').
 
--export([start/0, add_triggers/1]).
+-export([start/0, add_triggers/1, set_log_level/1]).
 
 -behaviour(gen_server).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -35,6 +35,8 @@ add_triggers([_|_]=Triggers) ->
 add_triggers(Trigger) ->
     add_triggers([Trigger]).
 
+set_log_level(Level) ->
+    gen_server:call(?MODULE,{set_log_level, Level}).
 
 %% gen_server implementation
 -record(rt_st,{tracer,
@@ -57,6 +59,8 @@ add_triggers(Trigger) ->
                     pids = #{} }).
 
 init(_) ->
+    State = #rt_st{},
+    pd_set_log_level(State#rt_st.log_level),
     {ok, #rt_st{}}.
 
 handle_call({monitor,Pid}, _From, #rt_st{ pids = Pids } = State)
@@ -74,10 +78,17 @@ handle_call({add_triggers, TriggerSpecs}, _From, State) ->
             {reply,{error,no_valid_specs},State};
         Triggers ->
             #rt_st{ triggers = Existing } = State1 = ensure_tracing(State),
-            tf_cast({add_triggers, Triggers}),
+            tf_add_triggers(Triggers),
             maps:map(fun set_trigger_tpls/2, Triggers),
             {reply,ok,State1#rt_st{ triggers = maps:merge(Existing, Triggers)}}
     end;
+handle_call({set_log_level, Level}, _From, #rt_st{ tracer = Tracer } = State) ->
+    pd_set_log_level(Level),
+    if is_pid(Tracer) ->
+            tf_set_log_level(Level);
+       true -> ok
+    end,
+    {reply, ok, State#rt_st{ log_level = Level }};
 handle_call(Msg, From, State) ->
     warn("Unknown call from ~p: ~p~n",[From,Msg]),
     {reply,ok,State}.
@@ -86,20 +97,21 @@ handle_info({'DOWN',MRef, process, Pid, _Reason} = Down,
             #rt_st{ pids = Pids, mrefs = MRefs } = State) ->
     State1 = State#rt_st{ pids = maps:remove(Pid,Pids),
                           mrefs = maps:remove(MRef,MRefs) },
-    tf_cast(Down),
+    tf_send_down(Down),
     {noreply, State1};
 handle_info(Msg, State) ->
     {noreply, handle_print(warning,"Unknown message: ~p~n",[Msg], State)}.
 
 ensure_tracing(#rt_st{ tracer = Tracer } = State) when is_pid(Tracer) ->
     State;
-ensure_tracing(State) ->
-    TracerState = tf_init(),
+ensure_tracing(#rt_st{ log_level = Log_Level } = State) ->
+    TracerState = tf_init_state(),
     {ok,Tracer} = dbg:tracer(process,{fun ?MODULE:tf/2,TracerState}),
-    dbg:p(all,call),
-    dbg:tpl(?MODULE,tf_cast,[{'_',[],[]}]),
     link(Tracer),
-    tf_cast({set_manager,self()}),
+    dbg:p(all,call),
+    tf_set_tpls(),
+    tf_set_manager(self()),
+    tf_set_log_level(Log_Level),
     info("Started tracer ~p~n",[Tracer]),
     State#rt_st{ tracer = Tracer }.
 
@@ -150,11 +162,6 @@ handle_cast(Msg, State) ->
     warn("Unknown cast: ~p~n",[Msg]),
     {noreply, State}.
 
-numeric_level(debug) -> 0;
-numeric_level(info)  -> 1;
-numeric_level(warn)  -> 2;
-numeric_level(error) -> 3.
-
 handle_print(Level, Fmt, Args, #rt_st{ log_level = SetLevel } = State) ->
     case numeric_level(Level) >= numeric_level(SetLevel) of
         true ->
@@ -177,8 +184,23 @@ handle_print(Level, Fmt, Args, #rt_st{ log_level = SetLevel } = State) ->
                 triggers = #{}
               }).
 
-tf_init() ->
+tf_init_state() ->
     #rt_trc{}.
+
+tf_set_tpls() ->
+    dbg:tpl(?MODULE,tf_cast,[{'_',[],[]}]).
+
+tf_set_log_level(Level) ->
+    tf_cast({set_log_level, Level}).
+
+tf_set_manager(Manager) ->
+    tf_cast({set_manager, Manager}).
+
+tf_add_triggers(Triggers) ->
+    tf_cast({add_triggers, Triggers}).
+
+tf_send_down(Down) ->
+    tf_cast(Down).
 
 tf_cast(_Message) ->
     ok.
@@ -201,12 +223,15 @@ tf_(A,St) ->
     warn("UNKNOWN TRACE MESSAGE ~w~n", [A]),
     St.
 
-handle_tf_cast({'DOWN',_,process,Pid,_}, St) ->
-    end_trace(Pid, St);
+handle_tf_cast({set_log_level, Level}, St) ->
+    pd_set_log_level(Level),
+    St;
+handle_tf_cast({set_manager, Pid}, St) ->
+    St#rt_trc{ manager = Pid };
 handle_tf_cast({add_triggers, Triggers}, #rt_trc{ triggers = Existing } = St) ->
     St#rt_trc{ triggers = maps:merge(Existing, Triggers) };
-handle_tf_cast({set_manager, Pid}, St) ->
-    St#rt_trc{ manager = Pid }.
+handle_tf_cast({'DOWN',_,process,Pid,_}, St) ->
+    end_trace(Pid, St).
 
 run_triggers(Msg, #rt_trc{ triggers = Triggers } = St) ->
     dbg("run_triggers:~n~p~n",[Triggers]),
@@ -360,9 +385,31 @@ incr_prints(#rt_trigger{ key = K }, #rt_trc{ triggers = Triggers } = State) ->
     info("Trigger ~p hit print limit~n",[K]),
     State#rt_trc{ triggers = maps:remove(K, Triggers) }.
 
+numeric_level(debug) -> 0;
+numeric_level(info)  -> 1;
+numeric_level(warn)  -> 2;
+numeric_level(error) -> 3.
+
+pd_log_level() ->
+    case get({?MODULE,log_level}) of
+        undefined -> 3;
+        Level -> Level
+    end.
+
+pd_set_log_level(Level) ->
+    put({?MODULE,log_level},numeric_level(Level)).
+
+do_print(Level, Fmt, Args) ->
+    do_print(numeric_level(Level), pd_log_level(), Fmt, Args).
+
+do_print(Level, SetLevel, Fmt, Args) when Level >= SetLevel ->
+    gen_server:cast(?MODULE,{print,Level,Fmt,Args});
+do_print(_, _, _, _) ->
+    ok.
+
 -define(PRINTFN(NAME,LEVEL),
 NAME(Fmt,Args) ->
-    gen_server:cast(?MODULE,{print,LEVEL,Fmt,Args})).
+    do_print(LEVEL,Fmt,Args)).
 
 ?PRINTFN(dbg,debug).
 ?PRINTFN(info,info).
