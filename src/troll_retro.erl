@@ -100,7 +100,8 @@ handle_info({'DOWN',MRef, process, Pid, _Reason} = Down,
     tf_send_down(Down),
     {noreply, State1};
 handle_info(Msg, State) ->
-    {noreply, handle_print(warning,"Unknown message: ~p~n",[Msg], State)}.
+    warn("Unknown message: ~p~n",[Msg]),
+    {noreply, State}.
 
 ensure_tracing(#rt_st{ tracer = Tracer } = State) when is_pid(Tracer) ->
     State;
@@ -257,7 +258,8 @@ run_trigger(Msg, Pid, K, #rt_trigger{ function = Fun, state = TrigSt,
     {Action, TrigSt2} =
         case MaybeAction of
             Act when Act =:= start_trace; Act =:= print_trace;
-                     Act =:= flush_trace; Act =:= end_trace; Act =:= abort_trace ->
+                     Act =:= print_message; Act =:= end_trace;
+                     Act =:= flush_trace; Act =:= abort_trace ->
                 {Act, TrigSt1};
             Act when Act =:= ok; Act =:= pass; Act =:= none ->
                 {none, TrigSt1};
