@@ -16,6 +16,14 @@
          l/0, mm/0, la/0]).
 -export([my_tracer/0, my_dhandler/2, filt_state_from_term/1]).
 
+-ignore_xref([help/0,dbgtc/1, dbgon/1, dbgon/2, dbgmulti/1,
+              dbgadd/1, dbgadd/2, dbgdel/1, dbgdel/2, dbgoff/0,
+              setup_teardown_wrapper/2,
+              dbg_ip_trace/1,
+              l/0, mm/0, la/0,
+              my_tracer/0, my_dhandler/2, filt_state_from_term/1
+             ]).
+
 -import(io, [format/1]).
 
 help() ->

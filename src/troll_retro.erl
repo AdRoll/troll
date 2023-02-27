@@ -2,11 +2,13 @@
 -author('josh@qhool.com').
 
 -export([start/0, add_triggers/1, set_log_level/1]).
+-ignore_xref([start/0, add_triggers/1, set_log_level/1]).
 
 -behaviour(gen_server).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
--export([tf/2, tf_cast/1]).
+%% Exported for use by dbg:tracer/2
+-export([tf/2]).
 
 -export_type([trigger_action/0, trigger_function/1, trigger_spec/1]).
 
