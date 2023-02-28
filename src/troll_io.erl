@@ -2,10 +2,13 @@
 %%% a single place, and also opens the door to future optimizations
 -module(troll_io).
 
--export([format/2, format/3]).
+-export([format/1, format/2, format/3]).
+
+format(Fmt) ->
+    io:fwrite(Fmt).
 
 format(Fmt, Args) ->
-    troll_io:fwrite(Fmt, Args).
+    io:fwrite(Fmt, Args).
 
 format(Device, Fmt, Args) ->
-    troll_io:fwrite(Device, Fmt, Args).
+    io:fwrite(Device, Fmt, Args).
