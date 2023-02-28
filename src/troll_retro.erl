@@ -171,10 +171,8 @@ handle_print(Level, Fmt, Args, #rt_st{log_level = SetLevel} = State) ->
          message_count = 0,
          message_limit = 100,
          on_limit = rotate :: rotate | stop,
-         printer = fun default_printer/1,
-         triggers = []}).
--record(rt_trc,
-        {manager, printer = fun default_printer/1, store = true, pids = #{}, triggers = #{}}).
+         printer = fun default_printer/1}).
+-record(rt_trc, {manager, printer = fun default_printer/1, pids = #{}, triggers = #{}}).
 
 tf_init_state() ->
     #rt_trc{}.
