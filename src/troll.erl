@@ -1,9 +1,6 @@
-%%% copied and bastardized by josh@qhool.com from
-%%% http://www.snookles.com/erlang/user_default.erl
+%%% copied and bastardized by josh@qhool.com from:
+%%% http://www.snookles.com/erlang/user_default.erl (author serge@hq.idt.net)
 -module(troll).
-
--author('serge@hq.idt.net').
--author('josh@qhool.com').
 
 %% Compile this file and use this line in your ~/.erlang file (with
 %% correct path, of course!) to where the troll.beam file is stored.
@@ -12,7 +9,6 @@
 
 -export([help/0, dbgtc/1, dbgon/1, dbgon/2, dbgmulti/1, dbgadd/1, dbgadd/2, dbgdel/1,
          dbgdel/2, dbgoff/0, setup_teardown_wrapper/2, dbg_ip_trace/1, l/0, mm/0, la/0]).
--export([my_tracer/0, my_dhandler/2, filt_state_from_term/1]).
 
 -ignore_xref([help/0,
               dbgtc/1,
@@ -54,11 +50,11 @@ help() ->
 
 dbgtc(File) ->
     Fun = fun ({trace, _, call, {M, F, A}}, _) ->
-                  io:format("call: ~w:~w~w~n", [M, F, A]);
+                  troll_io:format("call: ~w:~w~w~n", [M, F, A]);
               ({trace, _, return_from, {M, F, A}, R}, _) ->
-                  io:format("retn: ~w:~w/~w -> ~w~n", [M, F, A, R]);
+                  troll_io:format("retn: ~w:~w/~w -> ~w~n", [M, F, A, R]);
               (A, B) ->
-                  io:format("~w: ~w~n", [A, B])
+                  troll_io:format("~w: ~w~n", [A, B])
           end,
     dbg:trace_client(file, File, {Fun, []}).
 
@@ -68,8 +64,7 @@ dbgon(Module) ->
     case dbg:tracer() of
         {ok, _} ->
             dbg:p(all, call),
-            dbg:tpl(Module, [{'_', [], [{return_trace}]}]),
-            ok;
+            dbgadd(Module);
         Else ->
             Else
     end.
@@ -77,23 +72,17 @@ dbgon(Module) ->
 dbgon(Module, Fun) when is_atom(Fun) ->
     {ok, _} = dbg:tracer(),
     dbg:p(all, call),
-    %%dbg:tpl(Module, Fun, [{'_',[],[{return_trace}]}]),
-    dbg:tpl(Module, Fun, [{'_', [], [{return_trace}, {exception_trace}]}]),
-    ok;
+    dbgadd(Module, Fun);
 dbgon(Module, File) when is_list(File) ->
     {ok, _} = dbg:tracer(port, dbg:trace_port(file, File)),
     dbg:p(all, [call, running, garbage_collection, timestamp, return_to]),
-    %%dbg:tpl(Module, [{'_',[],[{return_trace}]}]),
-    dbg:tpl(Module, [{'_', [], [{return_trace}, {exception_trace}]}]),
-    ok;
+    dbgadd(Module);
 dbgon(Module, TcpPort) when is_integer(TcpPort) ->
-    io:format("Use this command on the node you're tracing (-remsh ...)\n"),
-    io:format("Use dbg:stop() on target node when done.\n"),
+    troll_io:format("Use this command on the node you're tracing (-remsh ...)\n"),
+    troll_io:format("Use dbg:stop() on target node when done.\n"),
     {ok, _} = dbg:tracer(port, dbg:trace_port(ip, TcpPort)),
     dbg:p(all, call),
-    %%dbg:tpl(Module, [{'_',[],[{return_trace}]}]),
-    dbg:tpl(Module, [{'_', [], [{return_trace}, {exception_trace}]}]),
-    ok.
+    dbgadd(Module).
 
 dbgmulti(Items) ->
     dbgmulti(Items, []).
@@ -116,19 +105,17 @@ dbgmulti([], [First | Rest]) ->
     [dbgadd(X) || X <- Rest].
 
 dbg_ip_trace(TcpPort) ->
-    io:format("Run on same machine as target but NOT -remsh target-node\n"),
-    io:format("Use dbg:stop() when done.\n"),
+    troll_io:format("Run on same machine as target but NOT -remsh target-node\n"),
+    troll_io:format("Use dbg:stop() when done.\n"),
     dbg:trace_client(ip, TcpPort).
 
 dbgadd({Module, Fun}) ->
     dbgadd(Module, Fun);
 dbgadd(Module) ->
-    %%dbg:tpl(Module, [{'_',[],[{return_trace}]}]),
     dbg:tpl(Module, [{'_', [], [{return_trace}, {exception_trace}]}]),
     ok.
 
 dbgadd(Module, Fun) ->
-    %%dbg:tpl(Module, Fun, [{'_',[],[{return_trace}]}]),
     dbg:tpl(Module, Fun, [{'_', [], [{return_trace}, {exception_trace}]}]),
     ok.
 
@@ -239,24 +226,3 @@ la() ->
                 end,
                 [],
                 Ms).
-
-my_tracer() ->
-    dbg:tracer(process, {fun my_dhandler/2, user}).
-
-my_dhandler(TraceMsg, Acc) ->
-    dbg:dhandler(filt_state_from_term(TraceMsg), Acc).
-
-filt_state_from_term(T) when is_tuple(T), element(1, T) == state ->
-    sTatE;
-filt_state_from_term(T) when is_tuple(T), element(1, T) == chain_r ->
-    cHain_R;
-filt_state_from_term(T) when is_tuple(T), element(1, T) == g_hash_r ->
-    g_Hash_R;
-filt_state_from_term(T) when is_tuple(T), element(1, T) == hash_r ->
-    hAsh_R;
-filt_state_from_term(T) when is_tuple(T) ->
-    list_to_tuple(filt_state_from_term(tuple_to_list(T)));
-filt_state_from_term([H | T]) ->
-    [filt_state_from_term(H) | filt_state_from_term(T)];
-filt_state_from_term(X) ->
-    X.

@@ -1,7 +1,5 @@
 -module(troll_retro).
 
--author('josh@qhool.com').
-
 -export([start/0, add_triggers/1, set_log_level/1]).
 
 -ignore_xref([start/0, add_triggers/1, set_log_level/1]).
@@ -79,13 +77,9 @@ handle_call({add_triggers, TriggerSpecs}, _From, State) ->
             maps:map(fun set_trigger_tpls/2, Triggers),
             {reply, ok, State1#rt_st{triggers = maps:merge(Existing, Triggers)}}
     end;
-handle_call({set_log_level, Level}, _From, #rt_st{tracer = Tracer} = State) ->
+handle_call({set_log_level, Level}, _From, State) ->
     pd_set_log_level(Level),
-    if is_pid(Tracer) ->
-           tf_set_log_level(Level);
-       true ->
-           ok
-    end,
+    tf_set_log_level(Level),
     {reply, ok, State#rt_st{log_level = Level}};
 handle_call(Msg, From, State) ->
     warn("Unknown call from ~p: ~p~n", [From, Msg]),
@@ -102,14 +96,14 @@ handle_info(Msg, State) ->
 
 ensure_tracing(#rt_st{tracer = Tracer} = State) when is_pid(Tracer) ->
     State;
-ensure_tracing(#rt_st{log_level = Log_Level} = State) ->
+ensure_tracing(#rt_st{log_level = LogLevel} = State) ->
     TracerState = tf_init_state(),
     {ok, Tracer} = dbg:tracer(process, {fun ?MODULE:tf/2, TracerState}),
     link(Tracer),
     dbg:p(all, call),
     tf_set_tpls(),
     tf_set_manager(self()),
-    tf_set_log_level(Log_Level),
+    tf_set_log_level(LogLevel),
     info("Started tracer ~p~n", [Tracer]),
     State#rt_st{tracer = Tracer}.
 
@@ -164,9 +158,9 @@ handle_cast(Msg, State) ->
 handle_print(Level, Fmt, Args, #rt_st{log_level = SetLevel} = State) ->
     case numeric_level(Level) >= numeric_level(SetLevel) of
         true ->
-            io:format(standard_error,
-                      "TR ~s: " ++ Fmt,
-                      [string:uppercase(atom_to_list(Level)) | Args]);
+            troll_io:format(standard_error,
+                            "TR ~s: " ++ Fmt,
+                            [string:uppercase(atom_to_list(Level)) | Args]);
         _ ->
             ok
     end,
@@ -481,8 +475,8 @@ default_printer({trace, Pid, call, {M, F, A}}) ->
                         lists:duplicate(Len, ", ~p")),
                 AF
         end,
-    io:format("[~p] call   ~p:~p(" ++ ArgsFmt ++ ")~n", [Pid, M, F | A]);
+    troll_io:format("[~p] call   ~p:~p(" ++ ArgsFmt ++ ")~n", [Pid, M, F | A]);
 default_printer({trace, Pid, return_from, {M, F, _A}, R}) ->
-    io:format("[~p] return ~p:~p(…) -> ~p~n", [Pid, M, F, R]);
+    troll_io:format("[~p] return ~p:~p(…) -> ~p~n", [Pid, M, F, R]);
 default_printer(Other) ->
-    io:format("??unknown?? ~p~n", [Other]).
+    troll_io:format("??unknown?? ~p~n", [Other]).
