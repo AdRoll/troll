@@ -39,7 +39,13 @@ set_log_level(Level) ->
     gen_server:call(?MODULE, {set_log_level, Level}).
 
 %% gen_server implementation
--record(rt_st, {tracer, pids = #{}, mrefs = #{}, triggers = #{}, log_level = info}).
+-record(rt_st,
+        {tracer,
+         printer = fun default_printer/1,
+         pids = #{},
+         mrefs = #{},
+         triggers = #{},
+         log_level = info}).
 -record(rt_trigger,
         {key,
          function,
@@ -56,7 +62,7 @@ set_log_level(Level) ->
 
 init(_) ->
     State = #rt_st{},
-    pd_set_log_level(State#rt_st.log_level),
+    do_set_log_level(State),
     {ok, #rt_st{}}.
 
 handle_call({monitor, Pid}, _From, #rt_st{pids = Pids} = State)
@@ -65,6 +71,9 @@ handle_call({monitor, Pid}, _From, #rt_st{pids = Pids} = State)
 handle_call({monitor, Pid}, _From, #rt_st{pids = Pids, mrefs = MRefs} = State) ->
     MRef = monitor(process, Pid),
     State1 = State#rt_st{pids = Pids#{Pid => MRef}, mrefs = MRefs#{MRef => Pid}},
+    {reply, ok, State1};
+handle_call({reconfigure, Config}, _From, State) ->
+    State1 = handle_reconfigure(Config, State),
     {reply, ok, State1};
 handle_call({add_triggers, TriggerSpecs}, _From, State) ->
     case build_triggers(TriggerSpecs, []) of
@@ -94,16 +103,59 @@ handle_info(Msg, State) ->
     warn("Unknown message: ~p~n", [Msg]),
     {noreply, State}.
 
+handle_reconfigure(Config, State) when is_map(Config) ->
+    case maps:fold(fun reconfigure_item/3, State, Config) of
+        {error, What} ->
+            {{error, What}, State};
+        {SideEffects, State} ->
+            State1 = execute_side_effects(SideEffects, State),
+            {ok, State1}
+    end;
+handle_reconfigure(Config, State) ->
+    handle_reconfigure(maps:from_list(Config), {[], State}).
+
+reconfigure_item(_, _, {error, _} = Err) ->
+    Err;
+reconfigure_item(printer, Printer, {SideEffects, State}) when is_function(Printer, 1) ->
+    {[{fun tf_set_printer/1, [Printer]} | SideEffects], State#rt_st{printer = Printer}};
+reconfigure_item(printer, Printer, _) ->
+    err("Bad print function: ~p~n", [Printer]),
+    {error, {bad_print_function, Printer}};
+reconfigure_item(log_level, Level, {SideEffects, State}) ->
+    {[{fun do_set_log_level/1, [state]} | SideEffects], State#rt_st{log_level = Level}};
+reconfigure_item(Other, _, _) ->
+    err("Unknown config option ~p", [Other]),
+    {error, {unknown_option, Other}}.
+
+execute_side_effects(SideEffects, State) ->
+    lists:foreach(fun({SideEffect, Args}) ->
+                     erlang:apply(SideEffect, fill_placeholders(Args, State))
+                  end,
+                  SideEffects).
+
+fill_placeholders(Args, State) ->
+    [case Arg of
+         state ->
+             State;
+         _ ->
+             Arg
+     end
+     || Arg <- Args].
+
+do_set_log_level(#rt_st{log_level = LogLevel}) ->
+    pd_set_log_level(LogLevel),
+    tf_set_log_level(LogLevel).
+
 ensure_tracing(#rt_st{tracer = Tracer} = State) when is_pid(Tracer) ->
     State;
-ensure_tracing(#rt_st{log_level = LogLevel} = State) ->
+ensure_tracing(#rt_st{} = State) ->
     TracerState = tf_init_state(),
     {ok, Tracer} = dbg:tracer(process, {fun ?MODULE:tf/2, TracerState}),
     link(Tracer),
     dbg:p(all, call),
     tf_set_tpls(),
     tf_set_manager(self()),
-    tf_set_log_level(LogLevel),
+    do_set_log_level(State),
     info("Started tracer ~p~n", [Tracer]),
     State#rt_st{tracer = Tracer}.
 
@@ -170,8 +222,7 @@ handle_print(Level, Fmt, Args, #rt_st{log_level = SetLevel} = State) ->
         {messages = queue:new(),
          message_count = 0,
          message_limit = 100,
-         on_limit = rotate :: rotate | stop,
-         printer = fun default_printer/1}).
+         on_limit = rotate :: rotate | stop}).
 -record(rt_trc, {manager, printer = fun default_printer/1, pids = #{}, triggers = #{}}).
 
 tf_init_state() ->
@@ -185,6 +236,9 @@ tf_set_log_level(Level) ->
 
 tf_set_manager(Manager) ->
     tf_cast({set_manager, Manager}).
+
+tf_set_printer(Printer) ->
+    tf_cast({set_printer, Printer}).
 
 tf_add_triggers(Triggers) ->
     tf_cast({add_triggers, Triggers}).
@@ -222,6 +276,8 @@ handle_tf_cast({set_manager, Pid}, St) ->
     St#rt_trc{manager = Pid};
 handle_tf_cast({add_triggers, Triggers}, #rt_trc{triggers = Existing} = St) ->
     St#rt_trc{triggers = maps:merge(Existing, Triggers)};
+handle_tf_cast({set_printer, Printer}, #rt_trc{} = St) ->
+    St#rt_trc{printer = Printer};
 handle_tf_cast({'DOWN', _, process, Pid, _}, St) ->
     end_trace(Pid, St).
 
@@ -344,7 +400,7 @@ print_message(Msg, #rt_trc{printer = Printer} = St) ->
     St.
 
 print_trace(MsgOrPid, #rt_trc{printer = Printer} = St) ->
-    {ok, #rt_pid{messages = Msgs, printer = Printer}} = get_trace(MsgOrPid, St),
+    {ok, #rt_pid{messages = Msgs}} = get_trace(MsgOrPid, St),
     MsgList = queue:to_list(Msgs),
     dbg("Printing ~p~n", [MsgList]),
     [Printer(Msg) || Msg <- queue:to_list(Msgs)],

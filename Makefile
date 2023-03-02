@@ -2,7 +2,8 @@ REBAR3 := rebar3
 
 .PHONY: all compile check
 
-check: compile dialyzer lint xref hank
+check:
+	$(REBAR3) do compile, dialyzer, lint, xref, hank
 
 compile:
 	$(REBAR3) compile
@@ -19,5 +20,5 @@ xref:
 hank:
 	$(REBAR3) hank
 
-format: check
+format:
 	$(REBAR3) format
