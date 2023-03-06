@@ -1,6 +1,6 @@
 -module(troll_retro).
 
--export([start/0, add_triggers/1, set_log_level/1]).
+-export([start/0, add_triggers/1, repeat_trigger/1, set_log_level/1]).
 
 -ignore_xref([start/0, add_triggers/1, set_log_level/1]).
 
@@ -31,9 +31,16 @@ start() ->
     gen_server:start({local, ?MODULE}, ?MODULE, [], []).
 
 add_triggers([_ | _] = Triggers) ->
-    gen_server:call(?MODULE, {add_triggers, Triggers});
+    CompiledTriggers = lists:map(fun compile_trigger/1, Triggers),
+    gen_server:call(?MODULE, {add_triggers, CompiledTriggers});
 add_triggers(Trigger) ->
     add_triggers([Trigger]).
+
+repeat_trigger(Key) ->
+    gen_server:call(?MODULE, {repeat_trigger, Key}).
+
+compile_trigger(#{function := TriggerFun} = Trigger) ->
+    Trigger#{ function => troll_code:optimize_fun(TriggerFun) }.
 
 set_log_level(Level) ->
     gen_server:call(?MODULE, {set_log_level, Level}).
@@ -86,6 +93,10 @@ handle_call({add_triggers, TriggerSpecs}, _From, State) ->
             maps:map(fun set_trigger_tpls/2, Triggers),
             {reply, ok, State1#rt_st{triggers = maps:merge(Existing, Triggers)}}
     end;
+handle_call({repeat_trigger,Key}, _From, State) ->
+    #rt_st{triggers = Triggers} = State1 = ensure_tracing(State),
+    tf_add_triggers(maps:with([Key], Triggers)),
+    {reply, ok, State1};
 handle_call({set_log_level, Level}, _From, State) ->
     pd_set_log_level(Level),
     tf_set_log_level(Level),
@@ -171,6 +182,8 @@ build_triggers([TrigSpec | More], Out)
             build_triggers(More, Out);
         #rt_trigger{key = Key, bad_patterns = [_ | _] = BadPats} = Trigger ->
             warn("Trigger ~p had incomprehensible trace patterns: ~p~n", [Key, BadPats]),
+            build_triggers(More, [Trigger | Out]);
+        #rt_trigger{} = Trigger ->
             build_triggers(More, [Trigger | Out])
     end;
 build_triggers([BadSpec | More], Out) ->
@@ -401,9 +414,9 @@ print_message(Msg, #rt_trc{printer = Printer} = St) ->
 
 print_trace(MsgOrPid, #rt_trc{printer = Printer} = St) ->
     {ok, #rt_pid{messages = Msgs}} = get_trace(MsgOrPid, St),
-    MsgList = queue:to_list(Msgs),
+    MsgList = lists:reverse(queue:to_list(Msgs)),
     dbg("Printing ~p~n", [MsgList]),
-    [Printer(Msg) || Msg <- queue:to_list(Msgs)],
+    [Printer(Msg) || Msg <- MsgList],
     St.
 
 flush_trace(Msg, St) ->
@@ -476,11 +489,11 @@ pd_set_log_level(Level) ->
     put({?MODULE, log_level}, numeric_level(Level)).
 
 do_print(Level, Fmt, Args) ->
-    do_print(numeric_level(Level), pd_log_level(), Fmt, Args).
+    do_print(Level, numeric_level(Level), pd_log_level(), Fmt, Args).
 
-do_print(Level, SetLevel, Fmt, Args) when Level >= SetLevel ->
+do_print(Level, NumLevel, SetLevel, Fmt, Args) when NumLevel >= SetLevel ->
     gen_server:cast(?MODULE, {print, Level, Fmt, Args});
-do_print(_, _, _, _) ->
+do_print(_, _, _, _, _) ->
     ok.
 
 dbg(Fmt, Args) ->
@@ -505,7 +518,7 @@ normalize_patterns(Patterns) ->
         lists:unzip3(
             lists:map(fun normalize_pattern/1, Patterns)),
     TPLs = lists:map(fun tuple_to_list/1, Patterns0),
-    {TPLs, MFs, Unknowns}.
+    {TPLs, MFs, lists:flatten(Unknowns)}.
 
 normalize_pattern({Mod, Fun}) when is_atom(Mod), is_atom(Fun) ->
     {{Mod, Fun, [{'_', [], [{return_trace}]}]}, {Mod, Fun}, []};
