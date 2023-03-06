@@ -1,6 +1,7 @@
 -module(troll_code).
 
 -export([optimize_fun/1, optimize_fun/2]).
+
 -ignore_xref([optimize_fun/2]).
 
 optimize_fun(Fun) ->
@@ -20,17 +21,13 @@ optimize_fun(Fun, Options) ->
     end.
 
 options_to_map(Optionlist) ->
-    proplists:to_map(Optionlist ++ [],
-                     [{negations, [{no_match_spec, use_match_spec}]}]).
+    proplists:to_map(Optionlist ++ [], [{negations, [{no_match_spec, use_match_spec}]}]).
 
 optimize(BoundEnv, Clauses, Arity, Options) ->
     optimize_full_ms(full_ms(BoundEnv, Clauses, Options), BoundEnv, Clauses, Arity, Options).
 
 optimize_full_ms(undefined, BoundEnv, Clauses, Arity, Options) ->
-    optimize_stripped_ms(stripped_ms(BoundEnv, Clauses, Options),
-                         BoundEnv,
-                         Clauses,
-                         Arity);
+    optimize_stripped_ms(stripped_ms(BoundEnv, Clauses, Options), BoundEnv, Clauses, Arity);
 optimize_full_ms(MS, _BoundEnv, _Clauses, Arity, _Options) ->
     wrap_ms(MS, Arity).
 
@@ -83,9 +80,9 @@ compile_clauses([{clause, _, Args, _Guards, _Body} | _] = Clauses) ->
          {eof, {5, 1}}],
     {ok, Module, Bin} =
         compile:forms(
-            erl_syntax:revert_forms(Abstract),[nowarn_unused_vars]),
+            erl_syntax:revert_forms(Abstract), [nowarn_unused_vars]),
     {module, Module} = code:load_binary(Module, ModuleFile, Bin),
-    troll_io:format("Compiled function ~p:~p/~p~n",[Module,execute,Arity]),
+    troll_io:format("Compiled function ~p:~p/~p~n", [Module, execute, Arity]),
     {compiled, fun Module:execute/Arity}.
 
 fill_env(BoundEnv, Clauses) ->
@@ -135,7 +132,7 @@ tupelize_clauses(Clauses) ->
     lists:map(fun tupelize_clause/1, Clauses).
 
 tupelize_clause({clause, Loc, Args, Guards, Body}) ->
-    Args0 = [{tuple, Loc, [{atom,Loc,'$wrapped'} | Args]}],
+    Args0 = [{tuple, Loc, [{atom, Loc, '$wrapped'} | Args]}],
     {clause, Loc, Args0, Guards, Body}.
 
 strip_clauses(Clauses) ->

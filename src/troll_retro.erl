@@ -1,8 +1,15 @@
 -module(troll_retro).
 
--export([start/0, add_triggers/1, repeat_trigger/1, set_log_level/1]).
+-define(API,
+        start / 0,
+        add_triggers / 1,
+        repeat_trigger / 1,
+        set_log_level / 1,
+        set_printer / 1).
 
--ignore_xref([start/0, add_triggers/1, set_log_level/1]).
+-export([?API]).
+
+-ignore_xref([?API]).
 
 -behaviour(gen_server).
 
@@ -40,10 +47,16 @@ repeat_trigger(Key) ->
     gen_server:call(?MODULE, {repeat_trigger, Key}).
 
 compile_trigger(#{function := TriggerFun} = Trigger) ->
-    Trigger#{ function => troll_code:optimize_fun(TriggerFun) }.
+    Trigger#{function => troll_code:optimize_fun(TriggerFun)}.
 
 set_log_level(Level) ->
-    gen_server:call(?MODULE, {set_log_level, Level}).
+    reconfigure(#{log_level => Level}).
+
+set_printer(Printer) ->
+    reconfigure(#{printer => troll_code:optimize_fun(Printer)}).
+
+reconfigure(Map) ->
+    gen_server:call(?MODULE, {reconfigure, Map}).
 
 %% gen_server implementation
 -record(rt_st,
@@ -80,8 +93,8 @@ handle_call({monitor, Pid}, _From, #rt_st{pids = Pids, mrefs = MRefs} = State) -
     State1 = State#rt_st{pids = Pids#{Pid => MRef}, mrefs = MRefs#{MRef => Pid}},
     {reply, ok, State1};
 handle_call({reconfigure, Config}, _From, State) ->
-    State1 = handle_reconfigure(Config, State),
-    {reply, ok, State1};
+    {Reply, State1} = handle_reconfigure(Config, State),
+    {reply, Reply, State1};
 handle_call({add_triggers, TriggerSpecs}, _From, State) ->
     case build_triggers(TriggerSpecs, []) of
         #{} = M when map_size(M) == 0 ->
@@ -93,14 +106,10 @@ handle_call({add_triggers, TriggerSpecs}, _From, State) ->
             maps:map(fun set_trigger_tpls/2, Triggers),
             {reply, ok, State1#rt_st{triggers = maps:merge(Existing, Triggers)}}
     end;
-handle_call({repeat_trigger,Key}, _From, State) ->
+handle_call({repeat_trigger, Key}, _From, State) ->
     #rt_st{triggers = Triggers} = State1 = ensure_tracing(State),
     tf_add_triggers(maps:with([Key], Triggers)),
     {reply, ok, State1};
-handle_call({set_log_level, Level}, _From, State) ->
-    pd_set_log_level(Level),
-    tf_set_log_level(Level),
-    {reply, ok, State#rt_st{log_level = Level}};
 handle_call(Msg, From, State) ->
     warn("Unknown call from ~p: ~p~n", [From, Msg]),
     {reply, ok, State}.
@@ -115,22 +124,22 @@ handle_info(Msg, State) ->
     {noreply, State}.
 
 handle_reconfigure(Config, State) when is_map(Config) ->
-    case maps:fold(fun reconfigure_item/3, State, Config) of
+    case maps:fold(fun reconfigure_item/3, {[], State}, Config) of
         {error, What} ->
             {{error, What}, State};
-        {SideEffects, State} ->
-            State1 = execute_side_effects(SideEffects, State),
+        {SideEffects, State1} ->
+            execute_side_effects(SideEffects, State1),
             {ok, State1}
     end;
 handle_reconfigure(Config, State) ->
-    handle_reconfigure(maps:from_list(Config), {[], State}).
+    handle_reconfigure(maps:from_list(Config), State).
 
 reconfigure_item(_, _, {error, _} = Err) ->
     Err;
 reconfigure_item(printer, Printer, {SideEffects, State}) when is_function(Printer, 1) ->
     {[{fun tf_set_printer/1, [Printer]} | SideEffects], State#rt_st{printer = Printer}};
-reconfigure_item(printer, Printer, _) ->
-    err("Bad print function: ~p~n", [Printer]),
+reconfigure_item(printer, Printer, Acc) ->
+    err("Bad print function: ~p (~p)~n", [Printer, Acc]),
     {error, {bad_print_function, Printer}};
 reconfigure_item(log_level, Level, {SideEffects, State}) ->
     {[{fun do_set_log_level/1, [state]} | SideEffects], State#rt_st{log_level = Level}};
@@ -414,7 +423,9 @@ print_message(Msg, #rt_trc{printer = Printer} = St) ->
 
 print_trace(MsgOrPid, #rt_trc{printer = Printer} = St) ->
     {ok, #rt_pid{messages = Msgs}} = get_trace(MsgOrPid, St),
-    MsgList = lists:reverse(queue:to_list(Msgs)),
+    MsgList =
+        lists:reverse(
+            queue:to_list(Msgs)),
     dbg("Printing ~p~n", [MsgList]),
     [Printer(Msg) || Msg <- MsgList],
     St.
