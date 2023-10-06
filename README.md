@@ -67,6 +67,6 @@ TODO:
   * Try fun2ms
   * Try compiling to dynamic module
   * Warn or require a 'force' option to use shell funs that can't be compiled somehow
-* Docs docs docs!
+* Docs docs docs!!
 * Manually stop debugging
 * Message send/receive functionality (tie together trace to sending/receiving process)
